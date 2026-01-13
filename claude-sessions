@@ -1,0 +1,614 @@
+#!/bin/bash
+# claude-sessions - CLI pour explorer et gérer les conversations Claude
+# Usage: claude-sessions <command> [options]
+
+set -euo pipefail
+
+CLAUDE_PROJECTS="$HOME/.claude/projects"
+
+# Détecte le projet courant ou utilise l'argument
+get_project_path() {
+  local path="${1:-$PWD}"
+  # Résout le chemin absolu
+  path=$(realpath -m "$path" 2>/dev/null || echo "$path")
+  echo "$path" | sed 's|^/||; s|/|-|g'
+}
+
+# Résout un chemin vers un répertoire absolu
+resolve_dir() {
+  local path="${1:-.}"
+  realpath -m "$path" 2>/dev/null || echo "$path"
+}
+
+# Retrouve le vrai chemin depuis un nom de projet ou chemin
+resolve_project_path() {
+  local input="$1"
+
+  # Si c'est déjà un chemin valide
+  if [[ -d "$input" ]]; then
+    realpath "$input"
+    return 0
+  fi
+
+  # Si ça commence par ~ ou /, essaie de résoudre
+  if [[ "$input" =~ ^[~/] ]]; then
+    local expanded=$(eval echo "$input")
+    [[ -d "$expanded" ]] && echo "$expanded" && return 0
+  fi
+
+  # Cherche dans les répertoires connus
+  local search_dirs=("$HOME/projects" "$HOME/Projects")
+  local search_term="$input"
+  local search_term_underscore=$(echo "$input" | tr '-' '_')
+
+  for dir in "${search_dirs[@]}"; do
+    [[ ! -d "$dir" ]] && continue
+
+    # Cherche avec le nom tel quel
+    local found=$(ls -d "$dir"/*"$search_term"* 2>/dev/null | head -1)
+    [[ -n "$found" ]] && echo "$found" && return 0
+
+    # Cherche avec underscores
+    found=$(ls -d "$dir"/*"$search_term_underscore"* 2>/dev/null | head -1)
+    [[ -n "$found" ]] && echo "$found" && return 0
+  done
+
+  # Fallback: essaie le home directory
+  if [[ "$input" == "." ]] || [[ -z "$input" ]]; then
+    echo "$HOME"
+    return 0
+  fi
+
+  echo "Chemin non trouvé: $input" >&2
+  return 1
+}
+
+# Trouve le dossier projet dans .claude/projects
+# Accepte: chemin réel, ~, ., ou nom de projet
+find_project_dir() {
+  local input="$1"
+
+  # Si c'est un chemin réel ou relatif, le résoudre d'abord
+  local resolved=""
+  if [[ "$input" =~ ^[./~] ]] || [[ -d "$input" ]]; then
+    resolved=$(eval echo "$input" 2>/dev/null)
+    [[ -d "$resolved" ]] && resolved=$(realpath "$resolved")
+  fi
+
+  # Si on a résolu un chemin, convertir en format projet
+  if [[ -n "$resolved" ]] && [[ -d "$resolved" ]]; then
+    local proj=$(echo "$resolved" | sed 's|^/||; s|/|-|g; s|_|-|g')
+    local dir="$CLAUDE_PROJECTS/-$proj"
+    [[ -d "$dir" ]] && echo "$dir" && return 0
+  fi
+
+  # Cherche par nom de projet (match partiel)
+  local match=$(ls -d "$CLAUDE_PROJECTS"/*"$input"* 2>/dev/null | head -1)
+  [[ -n "$match" ]] && echo "$match" && return 0
+
+  # Essaie en convertissant les underscores en tirets
+  local input_dashes=$(echo "$input" | tr '_' '-')
+  match=$(ls -d "$CLAUDE_PROJECTS"/*"$input_dashes"* 2>/dev/null | head -1)
+  [[ -n "$match" ]] && echo "$match" && return 0
+
+  echo "Projet non trouvé: $input" >&2
+  return 1
+}
+
+# Convertit un PID en session ID
+# Retourne le session ID ou vide si pas trouvé
+pid_to_session() {
+  local pid="$1"
+
+  # Vérifie que le processus existe
+  [[ ! -d "/proc/$pid" ]] && return 1
+
+  # Vérifie que c'est un processus claude
+  local cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ')
+  [[ ! "$cmdline" =~ claude ]] && return 1
+
+  # Récupère le CWD
+  local cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)
+  [[ -z "$cwd" ]] && return 1
+
+  # Calcule l'epoch de démarrage du processus
+  local elapsed=$(ps -p "$pid" -o etimes= 2>/dev/null | tr -d ' ')
+  [[ -z "$elapsed" ]] && return 1
+  local start_epoch=$(($(date +%s) - elapsed))
+
+  # Cherche dans history.jsonl le sessionId correspondant
+  # (projet + timestamp dans les 60s après le démarrage)
+  local session_id=$(jq -r --argjson start "$start_epoch" '
+    select(.project == "'"$cwd"'") |
+    select((.timestamp / 1000) >= $start - 5 and (.timestamp / 1000) <= $start + 60) |
+    .sessionId
+  ' "$HOME/.claude/history.jsonl" 2>/dev/null | head -1)
+
+  [[ -n "$session_id" ]] && echo "$session_id"
+}
+
+# Récupère le CWD d'un PID Claude actif
+pid_to_cwd() {
+  local pid="$1"
+  [[ ! -d "/proc/$pid" ]] && return 1
+  local cmdline=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ')
+  [[ ! "$cmdline" =~ claude ]] && return 1
+  readlink "/proc/$pid/cwd" 2>/dev/null
+}
+
+# Trouve une session par ID partiel ou PID
+find_session() {
+  local proj_dir="$1"
+  local session_id="$2"
+
+  if [[ -n "$session_id" ]]; then
+    # Si c'est un PID (nombre pur), convertir en session ID
+    if [[ "$session_id" =~ ^[0-9]+$ ]]; then
+      local converted=$(pid_to_session "$session_id")
+      if [[ -n "$converted" ]]; then
+        session_id="$converted"
+      else
+        echo "PID $session_id: processus Claude non trouvé ou session non identifiable" >&2
+        return 1
+      fi
+    fi
+    ls "$proj_dir"/"$session_id"*.jsonl 2>/dev/null | head -1
+  else
+    ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1
+  fi
+}
+
+# ============================================================
+# COMMANDES DE LECTURE
+# ============================================================
+
+# Commande: list - Liste les sessions avec thèmes
+cmd_list() {
+  local proj_dir=$(find_project_dir "${1:-.}") || return 1
+  local limit="${2:-15}"
+
+  for f in $(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -"$limit"); do
+    local date=$(stat -c %y "$f" 2>/dev/null | cut -d' ' -f1)
+    local theme=$(head -n 15 "$f" | jq -r 'select(.type == "summary") | .summary' 2>/dev/null | head -1)
+    local id=$(basename "$f" .jsonl)
+    printf "[%s] %s %s\n" "$date" "${id:0:8}" "${theme:--}"
+  done
+}
+
+# Commande: history - Derniers messages d'une session
+# Usage: history [project|pid] [n|from-to] [session-id]
+# Si un PID est fourni comme premier arg, le projet et session sont résolus automatiquement
+cmd_history() {
+  local first_arg="${1:-.}"
+  local range="${2:-20}"
+  local session="${3:-}"
+
+  # Si le premier argument est un PID (nombre pur), résoudre projet et session
+  if [[ "$first_arg" =~ ^[0-9]+$ ]]; then
+    local pid="$first_arg"
+    local cwd=$(pid_to_cwd "$pid")
+    if [[ -z "$cwd" ]]; then
+      echo "PID $pid: processus Claude non trouvé" >&2
+      return 1
+    fi
+    first_arg="$cwd"
+    session=$(pid_to_session "$pid")
+    if [[ -z "$session" ]]; then
+      echo "PID $pid: session non identifiable" >&2
+      return 1
+    fi
+  fi
+
+  local proj_dir=$(find_project_dir "$first_arg") || return 1
+  local target=$(find_session "$proj_dir" "$session")
+  [[ -z "$target" ]] && echo "Aucune session trouvée" >&2 && return 1
+
+  # Extrait tous les messages avec numéros
+  local all_msgs=$(jq -r '
+    select(.type == "user" or .type == "assistant") |
+    (if .message.content | type == "string" then
+      .message.content
+    elif .message.content | type == "array" then
+      [.message.content[] | select(.type == "text") | .text] | join(" ")
+    else
+      ""
+    end) as $text |
+    select($text | length > 0) |
+    "[" + (.type | .[0:1] | ascii_upcase) + "] " + ($text | gsub("\n"; " ") | .[0:200])
+  ' "$target" 2>/dev/null | nl -ba -w3 -s': ')
+
+  local total=$(echo "$all_msgs" | wc -l)
+
+  # Parse range: "20" = last 20, "50-60" = messages 50 to 60
+  if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    local from="${BASH_REMATCH[1]}"
+    local to="${BASH_REMATCH[2]}"
+    echo "$all_msgs" | sed -n "${from},${to}p"
+    echo "-- [$from-$to / $total] --"
+  else
+    echo "$all_msgs" | tail -n "$range"
+    echo "-- [last $range / $total] --"
+  fi
+}
+
+# Commande: search - Recherche full-text avec ripgrep
+cmd_search() {
+  local keyword="${1:-}"
+  [[ -z "$keyword" ]] && echo "Usage: claude-sessions search <keyword> [project]" >&2 && return 1
+
+  local search_path
+  if [[ -n "${2:-}" ]]; then
+    search_path=$(find_project_dir "$2") || return 1
+  else
+    search_path="$CLAUDE_PROJECTS"
+  fi
+
+  rg -li "$keyword" "$search_path" --glob "*.jsonl" 2>/dev/null | while read -r f; do
+    local proj=$(dirname "$f" | xargs basename | sed 's/^-home-remenby$/~/; s/^-home-remenby-/~\//')
+    local id=$(basename "$f" .jsonl)
+    local date=$(stat -c %y "$f" 2>/dev/null | cut -d' ' -f1)
+
+    # Extrait texte des messages et cherche snippet
+    local snippet=$(jq -r '
+      select(.type == "user" or .type == "assistant") |
+      if .message.content | type == "string" then .message.content
+      elif .message.content | type == "array" then [.message.content[] | select(.type == "text") | .text] | join(" ")
+      else "" end
+    ' "$f" 2>/dev/null | rg -i -m1 -o ".{0,30}$keyword.{0,30}" 2>/dev/null | head -1 | tr '\n' ' ' | sed 's/  */ /g')
+
+    [[ -z "$snippet" ]] && continue
+    printf "[%s] %s %s\n  > ...%s...\n" "$date" "${id:0:8}" "$proj" "${snippet:0:70}"
+  done
+}
+
+# Commande: themes - Liste tous les thèmes d'une session
+# Usage: themes [project|pid] [session-id]
+cmd_themes() {
+  local first_arg="${1:-.}"
+  local session="${2:-}"
+
+  # Si le premier argument est un PID, résoudre projet et session
+  if [[ "$first_arg" =~ ^[0-9]+$ ]]; then
+    local pid="$first_arg"
+    local cwd=$(pid_to_cwd "$pid")
+    if [[ -z "$cwd" ]]; then
+      echo "PID $pid: processus Claude non trouvé" >&2
+      return 1
+    fi
+    first_arg="$cwd"
+    session=$(pid_to_session "$pid")
+    if [[ -z "$session" ]]; then
+      echo "PID $pid: session non identifiable" >&2
+      return 1
+    fi
+  fi
+
+  local proj_dir=$(find_project_dir "$first_arg") || return 1
+  local target=$(find_session "$proj_dir" "$session")
+  [[ -z "$target" ]] && echo "Aucune session trouvée" >&2 && return 1
+
+  jq -r 'select(.type == "summary") | .summary' "$target" 2>/dev/null
+}
+
+# Commande: projects - Liste tous les projets
+cmd_projects() {
+  for d in $(ls -dt "$CLAUDE_PROJECTS"/*/ 2>/dev/null); do
+    local count=$(ls "$d"/*.jsonl 2>/dev/null | wc -l)
+    [[ "$count" -eq 0 ]] && continue
+    local name=$(basename "$d" | sed 's/^-home-remenby$/~/; s/^-home-remenby-/~\//')
+    local last=$(ls -t "$d"/*.jsonl 2>/dev/null | head -1)
+    local date=$(stat -c %y "$last" 2>/dev/null | cut -d' ' -f1)
+    printf "[%s] %s (%s)\n" "$date" "$name" "$count"
+  done | head -20
+}
+
+# ============================================================
+# COMMANDES D'EXÉCUTION
+# ============================================================
+
+# Commande: spawn - Lance claude en background avec -p
+cmd_spawn() {
+  local dir=$(resolve_dir "${1:-.}")
+  shift || true
+  local prompt="$*"
+
+  [[ ! -d "$dir" ]] && echo "Répertoire non trouvé: $dir" >&2 && return 1
+  [[ -z "$prompt" ]] && echo "Usage: claude-sessions spawn <dir> <prompt>" >&2 && return 1
+
+  echo "Spawning Claude dans: $dir"
+  echo "Prompt: $prompt"
+  echo "─────────────────────────────────────────────────────"
+
+  cd "$dir" && claude -p "$prompt" &
+  local pid=$!
+  echo "PID: $pid"
+  echo "Utilisez 'jobs' ou 'fg' pour voir le résultat"
+}
+
+# Commande: open - Ouvre un nouveau terminal kitty avec claude
+# Usage: open [--loopback] <dir> [prompt]
+# Retourne le PID
+cmd_open() {
+  local loopback=0
+  if [[ "$1" == "--loopback" ]]; then
+    loopback=1
+    shift
+  fi
+
+  local dir=$(resolve_dir "${1:-.}")
+  shift || true
+  local prompt="$*"
+
+  [[ ! -d "$dir" ]] && echo "Répertoire non trouvé: $dir" >&2 && return 1
+
+  if [[ $loopback -eq 1 ]]; then
+    # Mode loopback: injecte les instructions de signal
+    mkdir -p "$SIGNALS_DIR"
+
+    local loopback_prompt="[LOOPBACK MODE]
+Quand tu as besoin d'aide de ton superviseur (question, bloqué, terminé), exécute:
+touch $SIGNALS_DIR/\$PPID.signal
+
+---
+$prompt"
+
+    launch_and_get_pid kitty --detach --directory "$dir" -e claude --dangerously-skip-permissions "$loopback_prompt"
+  else
+    # Mode normal
+    if [[ -n "$prompt" ]]; then
+      launch_and_get_pid kitty --detach --directory "$dir" -e claude --dangerously-skip-permissions "$prompt"
+    else
+      launch_and_get_pid kitty --detach --directory "$dir" -e claude --dangerously-skip-permissions
+    fi
+  fi
+}
+
+# Helper: lance kitty et retourne le PID du claude (pas kitty)
+launch_and_get_pid() {
+  # Exclut kitty des résultats
+  get_claude_pids() {
+    pgrep -f "claude.*--dangerously-skip-permissions" 2>/dev/null | while read pid; do
+      ps -p "$pid" -o comm= 2>/dev/null | grep -q "^claude$" && echo "$pid"
+    done | sort
+  }
+
+  local pids_before=$(get_claude_pids)
+
+  "$@"  # Exécute la commande kitty passée en argument
+
+  local new_pid=""
+  for i in {1..20}; do
+    sleep 0.2
+    local pids_after=$(get_claude_pids)
+    new_pid=$(comm -13 <(echo "$pids_before") <(echo "$pids_after") | tail -1)
+    [[ -n "$new_pid" ]] && break
+  done
+
+  if [[ -n "$new_pid" ]]; then
+    echo "$new_pid"
+  else
+    echo "PID non trouvé" >&2
+    return 1
+  fi
+}
+
+# Commande: resume - Reprend une conversation existante
+cmd_resume() {
+  local project="${1:-.}"
+  local session_id="${2:-}"
+
+  local dir=$(resolve_project_path "$project") || return 1
+  local proj_dir=$(find_project_dir "$project") || return 1
+  local target=$(find_session "$proj_dir" "$session_id")
+  [[ -z "$target" ]] && echo "Session non trouvée: $session_id" >&2 && return 1
+
+  local full_session_id=$(basename "$target" .jsonl)
+  launch_and_get_pid kitty --detach --directory "$dir" -e claude --dangerously-skip-permissions --resume "$full_session_id"
+}
+
+# Commande: last - Reprend la dernière session
+cmd_last() {
+  local project="${1:-.}"
+
+  local dir=$(resolve_project_path "$project") || return 1
+  local proj_dir=$(find_project_dir "$project") || return 1
+  local target=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
+  [[ -z "$target" ]] && echo "Aucune session trouvée" >&2 && return 1
+
+  local session_id=$(basename "$target" .jsonl)
+  launch_and_get_pid kitty --detach --directory "$dir" -e claude --dangerously-skip-permissions --resume "$session_id"
+}
+
+# ============================================================
+# COMMANDES DE GESTION DES AGENTS
+# ============================================================
+
+# Commande: ps - Liste les agents claude actifs
+cmd_ps() {
+  ps aux | grep -E "claude.*--dangerously-skip-permissions" | grep -v grep | grep -v "kitty" | while read -r line; do
+    local pid=$(echo "$line" | awk '{print $2}')
+    local cmd=$(echo "$line" | sed 's/.*claude /claude /' | cut -c1-80)
+    local children=$(pgrep -P "$pid" 2>/dev/null | wc -l)
+
+    printf "[%s] (%s enfants) %s\n" "$pid" "$children" "$cmd"
+  done
+}
+
+# Commande: kill - Arrête un agent par PID
+cmd_kill() {
+  local pid="${1:-}"
+  [[ -z "$pid" ]] && echo "Usage: claude-sessions kill <pid>" >&2 && return 1
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid"
+    echo "Agent $pid arrêté"
+  else
+    echo "PID $pid non trouvé" >&2
+    return 1
+  fi
+}
+
+SIGNALS_DIR="$HOME/.claude/signals"
+
+# Commande: wait - Attend un signal d'agent(s)
+# Usage: wait <timeout> [pid...]
+# Si pas de PID, écoute tous les signaux
+# Retourne le PID qui a signalé, ou "timeout"
+cmd_wait() {
+  local timeout="${1:-60}"
+  shift || true
+  local pids=("$@")
+
+  mkdir -p "$SIGNALS_DIR"
+
+  local start=$(date +%s)
+  while true; do
+    # Cherche les signaux
+    for signal_file in "$SIGNALS_DIR"/*.signal; do
+      [[ ! -f "$signal_file" ]] && continue
+
+      local pid=$(basename "$signal_file" .signal)
+
+      # Si PIDs spécifiés, vérifie que c'est un des PIDs attendus
+      if [[ ${#pids[@]} -gt 0 ]]; then
+        local found=0
+        for p in "${pids[@]}"; do
+          [[ "$p" == "$pid" ]] && found=1 && break
+        done
+        [[ $found -eq 0 ]] && continue
+      fi
+
+      # Consomme le signal
+      rm -f "$signal_file"
+      echo "$pid"
+      return 0
+    done
+
+    # Check timeout
+    local now=$(date +%s)
+    local elapsed=$((now - start))
+    if [[ $timeout -gt 0 ]] && [[ $elapsed -ge $timeout ]]; then
+      echo "timeout"
+      return 1
+    fi
+
+    sleep 0.5
+  done
+}
+
+# Commande: send - Envoie un message à un agent via kitty
+cmd_send() {
+  local pid="${1:-}"
+  shift || true
+  local message="$*"
+
+  [[ -z "$pid" ]] && echo "Usage: claude-sessions send <pid> <message>" >&2 && return 1
+  [[ -z "$message" ]] && echo "Usage: claude-sessions send <pid> <message>" >&2 && return 1
+
+  # Cherche dans tous les sockets kitty
+  local sockets=$(ls /tmp/kitty-remote-* 2>/dev/null)
+  if [[ -z "$sockets" ]]; then
+    echo "Socket kitty non trouvé. Activer remote control dans kitty.conf:" >&2
+    echo "  allow_remote_control yes" >&2
+    echo "  listen_on unix:/tmp/kitty-remote" >&2
+    return 1
+  fi
+
+  # Cherche la fenêtre dans chaque socket
+  local found_socket=""
+  local window_id=""
+  for socket in $sockets; do
+    window_id=$(kitty @ --to "unix:$socket" ls 2>/dev/null | jq -r "
+      .[] | .tabs[] | .windows[] |
+      select(.foreground_processes[]?.pid == $pid or .pid == $pid) |
+      .id
+    " | head -1)
+    if [[ -n "$window_id" ]]; then
+      found_socket="$socket"
+      break
+    fi
+  done
+
+  if [[ -z "$window_id" ]]; then
+    echo "Fenêtre kitty pour PID $pid non trouvée" >&2
+    return 1
+  fi
+
+  # Envoie le message
+  kitty @ --to "unix:$found_socket" send-text --match "id:$window_id" "$message"
+  kitty @ --to "unix:$found_socket" send-key --match "id:$window_id" enter
+
+  echo "Message envoyé à $pid"
+}
+
+# ============================================================
+# AIDE
+# ============================================================
+
+show_help() {
+  cat << 'EOF'
+claude-sessions - Gérer les conversations Claude Code
+
+USAGE:
+  claude-sessions <command> [options]
+
+LECTURE:
+  list [project] [n]              Liste les n dernières sessions (défaut: 15)
+  history [project|pid] [n] [id]  Derniers n messages (défaut: 20)
+  themes [project|pid] [id]       Liste les thèmes/branches d'une session
+  search <keyword> [project]      Recherche full-text (ripgrep)
+  projects                        Liste tous les projets
+
+  Note: history et themes acceptent un PID au lieu de project.
+  Le projet et la session sont alors résolus automatiquement.
+
+EXÉCUTION (retourne le PID):
+  open [--loopback] <dir> [prompt]  Ouvre kitty avec claude
+  resume <project> [session]        Reprend une session dans kitty
+  last <project>                    Reprend la dernière session
+
+  --loopback: injecte instructions pour signaler (touch ~/.claude/signals/$PPID.signal)
+
+AGENTS:
+  ps                           Liste les agents actifs (PID, enfants)
+  kill <pid>                   Arrête un agent
+  send <pid> <message>         Envoie un message à un agent
+  wait <timeout> [pid...]      Attend un signal (tous si pas de PID)
+
+EXEMPLES:
+  claude-sessions list pi-drone-nav
+  claude-sessions history atelier-nauge 10
+  claude-sessions search "auth"
+
+  # Workflow loopback (agent supervisé)
+  pid=$(claude-sessions open --loopback ~/project "Fix bug")
+  signaled=$(claude-sessions wait 300 $pid)   # Attend signal
+  claude-sessions history . 5                  # Lit ce qu'il a dit
+  claude-sessions send $pid "Continue"         # Répond
+EOF
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+
+case "${1:-help}" in
+  # Lecture
+  list)     shift; cmd_list "$@" ;;
+  history)  shift; cmd_history "$@" ;;
+  themes)   shift; cmd_themes "$@" ;;
+  search)   shift; cmd_search "$@" ;;
+  projects) cmd_projects ;;
+  # Exécution
+  open)     shift; cmd_open "$@" ;;
+  resume)   shift; cmd_resume "$@" ;;
+  last)     shift; cmd_last "$@" ;;
+  # Agents
+  ps)       cmd_ps ;;
+  kill)     shift; cmd_kill "$@" ;;
+  send)     shift; cmd_send "$@" ;;
+  wait)     shift; cmd_wait "$@" ;;
+  # Aide
+  help|--help|-h) show_help ;;
+  *) echo "Commande inconnue: $1" >&2; show_help; exit 1 ;;
+esac
